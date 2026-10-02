@@ -6,7 +6,7 @@ import ghidra.program.model.symbol.ReferenceManager;
 import ghidra.program.model.listing.Function;
 
 public class FindCallers extends GhidraScript {
-    static final long[] TARGETS = { 0x00034290L };
+    static final long[] TARGETS = { 0x001bdadaL };
 
     @Override
     public void run() throws Exception {

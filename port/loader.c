@@ -2694,7 +2694,9 @@ static void io_trap_handler(int sig, siginfo_t *si, void *ucontext_v) {
                         (unsigned) uc->uc_mcontext.gregs[REG_EIP], si->si_addr, region_len, mapped);
                 return; // retry the faulting instruction now that the page exists
             }
-            fprintf(stderr, "[io-trap] auto-provision mmap failed: %s\n", strerror(errno));
+            fprintf(stderr, "[io-trap] auto-provision mmap failed: %s (EIP=0x%x, fault addr=%p, wanted region=0x%x len=0x%zx)\n",
+                    strerror(errno), (unsigned) uc->uc_mcontext.gregs[REG_EIP], si->si_addr,
+                    (unsigned) region_start, region_len);
         }
 
         // Anything else - a real bug, not a hardware-access fault this
@@ -2795,6 +2797,19 @@ static void install_altstack_for_this_thread(void) {
 // IS a real polling loop (calls FUN_0017c320/FUN_0017bd00 every iteration),
 // so a background watcher can win the race here, same as the PFB-flush and
 // fence-ack fixes - just needs the right two bits asserted.
+// A fourth real hardware-wait loop, this time from the audio/APU side, not
+// NV2A (found live via gdb attach + disassembly on the stuck thread, not
+// guessed): `do {} while ((*(uint*)0xFE820010 & 0xFFFFFFFC) < 0x20);` - a
+// classic "wait for at least N units of free space in the DMA FIFO before
+// writing" hardware handshake (the masked-low-bits-then-compare pattern is
+// the real hardware's own status-register convention, not an artifact of
+// this loader). This register lives in the auto-provisioned MAPERR region
+// (0xFE8xxxxx, the AC97/audio-DAC aperture auto-mapped the same way as the
+// first NV2A MMIO pokes), not the fixed nv2a_fake mapping, but writing to it
+// is safe regardless of mapping order - a write before the game's own first
+// touch just causes the SAME auto-provision machinery to run from this
+// thread instead, which is equally safe.
+#define AUDIO_FIFO_FREE_SPACE_ADDR 0xFE820010u
 #define GAME_FENCE_TARGET_ADDR 0x181e10u
 #define NV2A_CHANNEL_FENCE_ACK_OFFSET 0x800044u
 #define NV2A_CHANNEL_STATUS_A_OFFSET 0x3214u
@@ -2806,11 +2821,13 @@ static void *nv2a_mmio_watcher(void *arg) {
     volatile uint32_t *fence_ack = (volatile uint32_t *) (uintptr_t) (NV2A_BASE + NV2A_CHANNEL_FENCE_ACK_OFFSET);
     volatile uint8_t *status_a = (volatile uint8_t *) (uintptr_t) (NV2A_BASE + NV2A_CHANNEL_STATUS_A_OFFSET);
     volatile uint8_t *status_b = (volatile uint8_t *) (uintptr_t) (NV2A_BASE + NV2A_CHANNEL_STATUS_B_OFFSET);
+    volatile uint32_t *audio_fifo_free = (volatile uint32_t *) (uintptr_t) AUDIO_FIFO_FREE_SPACE_ADDR;
     for (;;) {
         if (*pfb_flush & 0x10000u) *pfb_flush &= ~0x10000u;
         *fence_ack = *fence_target;
         *status_a |= 0x10u;
         *status_b |= 0x10u;
+        *audio_fifo_free = 0xFFFFFFFFu; // "FIFO always has room" - see block comment above
         usleep(1000);
     }
     return NULL;

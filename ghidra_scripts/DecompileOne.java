@@ -8,7 +8,7 @@ import ghidra.program.model.listing.Function;
 import ghidra.util.task.ConsoleTaskMonitor;
 
 public class DecompileOne extends GhidraScript {
-    static final long[] TARGETS = { 0x000341e0L };
+    static final long[] TARGETS = { 0x001bdc79L };
 
     @Override
     public void run() throws Exception {
