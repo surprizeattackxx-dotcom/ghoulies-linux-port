@@ -1,0 +1,20 @@
+# Copyrighted game assets - never commit these. The ISO itself lives
+# outside this repo (~/Downloads); these are extracted/derived copies of
+# the actual game binary, which this repo's own code regenerates from your
+# own legally-owned ISO via the documented rebuild commands.
+/xbe/
+/ghidra/
+/ghidra_rebuild/
+/ghidra_x86/
+
+# Build output and test-run state - regenerate, don't version.
+/port/loader
+/port/loader_dbg
+/port/hdd_root/
+*.o
+*.core
+core
+
+# Python bytecode cache
+__pycache__/
+*.pyc
