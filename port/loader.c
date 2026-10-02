@@ -52,6 +52,7 @@
 #include <ctype.h>
 #include <signal.h>
 #include <ucontext.h>
+#include <sys/uio.h> // process_vm_readv - fault-safe memory reads inside the SIGSEGV handler
 #include "xdvdfs.h"
 
 #define ISO_PATH "/home/donnie/Downloads/Grabbed by the Ghoulies (USA) (En,Fr,De,Es,It).iso"
@@ -2518,13 +2519,74 @@ static int nv2a_trap_handle(ucontext_t *uc, void *fault_addr_v) {
 // resume just past it. Anything that ISN'T one of these specific opcodes at
 // the fault site falls through to the default handler, so a genuine bug
 // still crashes and gets diagnosed the normal way, not silently hidden.
+// Reads guest memory from inside the SIGSEGV handler without risking a
+// nested fault. A plain dereference of a bad address there (e.g. decoding
+// the instruction at EIP after a call through a NULL function pointer, where
+// EIP itself is 0) faults again while SIGSEGV is blocked, and the kernel
+// kills the process with zero diagnostics - the same "silent death" seen
+// before with the KfRaiseIrql stack imbalance. process_vm_readv on our own
+// pid just returns EFAULT for unmapped memory instead.
+static int safe_read(uintptr_t addr, void *out, size_t len) {
+    struct iovec local = { out, len }, remote = { (void *) addr, len };
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t) len;
+}
+
+// Linux refuses to map anything below vm.mmap_min_addr (65536 by default),
+// and on real Xbox hardware nothing lives there either - any fault in this
+// range is a NULL pointer (plus a small field offset) dereference, never a
+// fixed-address assumption the auto-provision path should paper over.
+#define NULL_GUARD_LIMIT 0x10000u
+
+// Prints the top of the guest stack. When the fault is deep in game code
+// (or a call through a NULL function pointer, where [ESP] is the return
+// address right after the offending CALL), these are the caller addresses
+// to look up in Ghidra - the most useful single clue for root-causing it.
+static void dump_guest_stack(ucontext_t *uc) {
+    uint32_t esp = (uint32_t) uc->uc_mcontext.gregs[REG_ESP];
+    uint32_t words[12];
+    if (!safe_read(esp, words, sizeof(words))) {
+        fprintf(stderr, "  stack @ ESP=0x%x is unreadable\n", esp);
+        return;
+    }
+    fprintf(stderr, "  stack @ ESP=0x%x:", esp);
+    for (int i = 0; i < 12; i++) fprintf(stderr, "%s0x%08x", (i % 6 == 0) ? "\n    " : " ", words[i]);
+    fprintf(stderr, "\n");
+}
+
 static void io_trap_handler(int sig, siginfo_t *si, void *ucontext_v) {
     (void) sig;
     ucontext_t *uc = (ucontext_t *) ucontext_v;
 
     if (nv2a_trap_handle(uc, si->si_addr)) return;
 
-    uint8_t *pc = (uint8_t *) (uintptr_t) uc->uc_mcontext.gregs[REG_EIP];
+    // Copy the instruction bytes out fault-safely instead of dereferencing
+    // EIP directly (see safe_read). Byte at a time so an instruction ending
+    // right before an unmapped page still decodes; unreadable tail bytes
+    // stay zero, which none of the opcodes below match on.
+    uint32_t eip = (uint32_t) uc->uc_mcontext.gregs[REG_EIP];
+    uint8_t pc[16] = { 0 };
+    int pc_readable = 0;
+    while (pc_readable < (int) sizeof(pc) && safe_read(eip + pc_readable, &pc[pc_readable], 1)) pc_readable++;
+    if (pc_readable == 0) {
+        // The instruction FETCH itself faulted: execution jumped somewhere
+        // with no code - a call through a NULL/garbage function pointer, or
+        // a RET onto a corrupted return address. [ESP] (for a CALL) is the
+        // return address just past the CALL site that made the bad jump.
+        fprintf(stderr,
+                "\n[io-trap] EIP=0x%x is not executable/mapped (fault addr=%p) - %s\n"
+                "  EAX=0x%x EBX=0x%x ECX=0x%x EDX=0x%x ESI=0x%x EDI=0x%x EBP=0x%x ESP=0x%x\n",
+                eip, si->si_addr,
+                eip < NULL_GUARD_LIMIT ? "call through a NULL function pointer (or RET to garbage)"
+                                       : "jump/call to an unmapped address (or RET to garbage)",
+                (unsigned) uc->uc_mcontext.gregs[REG_EAX], (unsigned) uc->uc_mcontext.gregs[REG_EBX],
+                (unsigned) uc->uc_mcontext.gregs[REG_ECX], (unsigned) uc->uc_mcontext.gregs[REG_EDX],
+                (unsigned) uc->uc_mcontext.gregs[REG_ESI], (unsigned) uc->uc_mcontext.gregs[REG_EDI],
+                (unsigned) uc->uc_mcontext.gregs[REG_EBP], (unsigned) uc->uc_mcontext.gregs[REG_ESP]);
+        dump_guest_stack(uc);
+        fflush(stderr);
+        signal(SIGSEGV, SIG_DFL);
+        return;
+    }
 
     int has66 = (pc[0] == 0x66);
     uint8_t op = pc[has66 ? 1 : 0];
@@ -2591,8 +2653,18 @@ static void io_trap_handler(int sig, siginfo_t *si, void *ucontext_v) {
         // cap keeps the MAPERR path useful for genuine one-off "Xbox
         // assumed this address exists" cases while still surfacing a real
         // runaway as a crash, not unbounded memory growth.
+        // Never auto-provision the NULL guard range. Found live: a plain
+        // NULL dereference (si_addr == 0) came in here as SEGV_MAPERR like
+        // any other unmapped address, and the downward-window math below
+        // underflowed (0 - 0x40000 + 0x1000 = 0xFFFC1000), so MAP_FIXED was
+        // asked for a range that wraps past 4GB and failed. That printed an
+        // "auto-provision mmap failed" line that looked like the root cause
+        // and hid the real NULL pointer bug behind it.
         static int auto_provision_count = 0;
-        if (si->si_code == SEGV_MAPERR && auto_provision_count < 64) {
+        if (si->si_code == SEGV_MAPERR && (uintptr_t) si->si_addr < NULL_GUARD_LIMIT) {
+            fprintf(stderr, "[io-trap] fault addr %p is in the NULL guard range - NULL pointer "
+                    "dereference, not a fixed-address assumption; not auto-provisioning\n", si->si_addr);
+        } else if (si->si_code == SEGV_MAPERR && auto_provision_count < 64) {
             auto_provision_count++;
             uintptr_t fault_addr = (uintptr_t) si->si_addr;
             long pagesz = sysconf(_SC_PAGESIZE);
@@ -2607,7 +2679,12 @@ static void io_trap_handler(int sig, siginfo_t *si, void *ucontext_v) {
             // the fault's own page - never past it.
             uintptr_t fault_page = fault_addr & ~(uintptr_t) (pagesz - 1);
             size_t region_len = (size_t) pagesz * 64;
-            uintptr_t region_start = fault_page - region_len + (uintptr_t) pagesz;
+            // Clamp the window's bottom at NULL_GUARD_LIMIT instead of
+            // letting `fault_page - region_len` wrap for a fault just above it.
+            uintptr_t region_start = (fault_page >= NULL_GUARD_LIMIT + region_len - (uintptr_t) pagesz)
+                                         ? fault_page - region_len + (uintptr_t) pagesz
+                                         : NULL_GUARD_LIMIT;
+            region_len = fault_page + (uintptr_t) pagesz - region_start;
             void *mapped = mmap((void *) region_start, region_len, PROT_READ | PROT_WRITE,
                                  MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
             if (mapped != MAP_FAILED) {
@@ -2638,6 +2715,7 @@ static void io_trap_handler(int sig, siginfo_t *si, void *ucontext_v) {
                 (unsigned) uc->uc_mcontext.gregs[REG_ECX], (unsigned) uc->uc_mcontext.gregs[REG_EDX],
                 (unsigned) uc->uc_mcontext.gregs[REG_ESI], (unsigned) uc->uc_mcontext.gregs[REG_EDI],
                 (unsigned) uc->uc_mcontext.gregs[REG_EBP], (unsigned) uc->uc_mcontext.gregs[REG_ESP]);
+        dump_guest_stack(uc);
         fflush(stderr);
         signal(SIGSEGV, SIG_DFL);
         return;
